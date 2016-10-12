@@ -231,6 +231,7 @@ static void print_typed_value(WasmInterpreterTypedValue* tv) {
   }
 }
 
+#if 0
 static void print_typed_values(WasmInterpreterTypedValue* values,
                                size_t num_values) {
   uint32_t i;
@@ -263,9 +264,9 @@ static WasmResult default_host_callback(const WasmInterpreterFuncSignature* sig,
   printf(")\n");
   return WASM_OK;
 }
+#endif
 
-static WasmInterpreterResult run_defined_function(WasmInterpreterModule* module,
-                                                  WasmInterpreterThread* thread,
+static WasmInterpreterResult run_defined_function(WasmInterpreterThread* thread,
                                                   uint32_t offset) {
   thread->pc = offset;
   WasmInterpreterResult iresult = WASM_INTERPRETER_OK;
@@ -273,9 +274,8 @@ static WasmInterpreterResult run_defined_function(WasmInterpreterModule* module,
   uint32_t* call_stack_return_top = thread->call_stack_top;
   while (iresult == WASM_INTERPRETER_OK) {
     if (s_trace)
-      wasm_trace_pc(module, thread, s_stdout_stream);
-    iresult =
-        wasm_run_interpreter(module, thread, quantum, call_stack_return_top);
+      wasm_trace_pc(thread, s_stdout_stream);
+    iresult = wasm_run_interpreter(thread, quantum, call_stack_return_top);
   }
   if (iresult != WASM_INTERPRETER_RETURNED) {
     if (s_trace)
@@ -286,27 +286,23 @@ static WasmInterpreterResult run_defined_function(WasmInterpreterModule* module,
   return WASM_INTERPRETER_OK;
 }
 
-static WasmInterpreterResult run_function(WasmInterpreterModule* module,
-                                          WasmInterpreterThread* thread,
+static WasmInterpreterResult run_function(WasmInterpreterThread* thread,
                                           uint32_t func_index) {
-  assert(func_index < module->funcs.size);
-  WasmInterpreterFunc* func = &module->funcs.data[func_index];
-  if (func->is_host) {
-    WasmInterpreterImport* import = &module->imports.data[func->import_index];
-    return wasm_call_host(module, thread, import);
-  } else {
-    return run_defined_function(module, thread, func->offset);
-  }
+  assert(func_index < thread->env->funcs.size);
+  WasmInterpreterFunc* func = &thread->env->funcs.data[func_index];
+  if (func->is_host)
+    return wasm_call_host(thread, func);
+  else
+    return run_defined_function(thread, func->defined.offset);
 }
 
-static WasmResult run_start_function(WasmInterpreterModule* module,
-                                     WasmInterpreterThread* thread) {
+static WasmResult run_start_function(WasmInterpreterThread* thread) {
   WasmResult result = WASM_OK;
-  if (module->start_func_index != WASM_INVALID_FUNC_INDEX) {
+  if (thread->module->defined.start_func_index != WASM_INVALID_INDEX) {
     if (s_trace)
       printf(">>> running start function:\n");
     WasmInterpreterResult iresult =
-        run_function(module, thread, module->start_func_index);
+        run_function(thread, thread->module->defined.start_func_index);
     if (iresult != WASM_INTERPRETER_OK) {
       /* trap */
       fprintf(stderr, "error: %s\n", s_trap_strings[iresult]);
@@ -317,22 +313,22 @@ static WasmResult run_start_function(WasmInterpreterModule* module,
 }
 
 static WasmInterpreterFuncSignature* get_export_signature(
-    WasmInterpreterModule* module,
+    WasmInterpreterEnvironment* env,
     WasmInterpreterExport* export) {
+  assert(export->kind == WASM_EXTERNAL_KIND_FUNC);
   uint32_t func_index = export->index;
-  uint32_t sig_index = module->funcs.data[func_index].sig_index;
-  assert(sig_index < module->sigs.size);
-  return &module->sigs.data[sig_index];
+  uint32_t sig_index = env->funcs.data[func_index].sig_index;
+  assert(sig_index < env->sigs.size);
+  return &env->sigs.data[sig_index];
 }
 
 static WasmInterpreterResult run_export(
     WasmAllocator* allocator,
-    WasmInterpreterModule* module,
     WasmInterpreterThread* thread,
     WasmInterpreterExport* export,
-    WasmInterpreterFuncSignature* sig,
     WasmInterpreterTypedValueVector* out_results) {
   assert(export->kind == WASM_EXTERNAL_KIND_FUNC);
+  WasmInterpreterFuncSignature* sig = get_export_signature(thread->env, export);
 
   /* push all 0 values as arguments */
   assert(sig->param_types.size < thread->value_stack.size);
@@ -340,7 +336,7 @@ static WasmInterpreterResult run_export(
   thread->value_stack_top = &thread->value_stack.data[num_args];
   memset(thread->value_stack.data, 0, num_args * sizeof(WasmInterpreterValue));
 
-  WasmInterpreterResult result = run_function(module, thread, export->index);
+  WasmInterpreterResult result = run_function(thread, export->index);
 
   if (result == WASM_INTERPRETER_OK) {
     size_t expected_results = sig->result_types.size;
@@ -374,7 +370,6 @@ static WasmInterpreterResult run_export(
 
 static WasmInterpreterResult run_export_wrapper(
     WasmAllocator* allocator,
-    WasmInterpreterModule* module,
     WasmInterpreterThread* thread,
     WasmInterpreterExport* export,
     WasmInterpreterTypedValueVector* out_results,
@@ -384,11 +379,12 @@ static WasmInterpreterResult run_export_wrapper(
            WASM_PRINTF_STRING_SLICE_ARG(export->name));
   }
 
-  WasmInterpreterFuncSignature* sig = get_export_signature(module, export);
   WasmInterpreterResult result =
-      run_export(allocator, module, thread, export, sig, out_results);
+      run_export(allocator, thread, export, out_results);
 
   if (verbose) {
+    WasmInterpreterFuncSignature* sig =
+        get_export_signature(thread->env, export);
     printf(PRIstringslice "(", WASM_PRINTF_STRING_SLICE_ARG(export->name));
     size_t i;
     for (i = 0; i < sig->param_types.size; ++i) {
@@ -416,19 +412,18 @@ static WasmInterpreterResult run_export_wrapper(
 
 static WasmResult run_export_by_name(
     WasmAllocator* allocator,
-    WasmInterpreterModule* module,
     WasmInterpreterThread* thread,
     WasmStringSlice* name,
     WasmInterpreterResult* out_iresult,
     WasmInterpreterTypedValueVector* out_results,
     RunVerbosity verbose) {
   WasmInterpreterExport* export =
-      wasm_get_interpreter_export_by_name(module, name);
+      wasm_get_interpreter_export_by_name(thread->module, name);
   if (!export)
     return WASM_ERROR;
 
-  *out_iresult = run_export_wrapper(allocator, module, thread, export,
-                                    out_results, verbose);
+  *out_iresult =
+      run_export_wrapper(allocator, thread, export, out_results, verbose);
   return WASM_OK;
 }
 
@@ -441,69 +436,68 @@ static void run_all_exports(WasmAllocator* allocator,
   uint32_t i;
   for (i = 0; i < module->exports.size; ++i) {
     WasmInterpreterExport* export = &module->exports.data[i];
-    run_export_wrapper(allocator, module, thread, export, &results, verbose);
+    run_export_wrapper(allocator, thread, export, &results, verbose);
   }
   wasm_destroy_interpreter_typed_value_vector(allocator, &results);
 }
 
 static WasmResult read_module(WasmAllocator* allocator,
                               const char* module_filename,
-                              WasmInterpreterModule* out_module,
+                              WasmInterpreterEnvironment* env,
+                              WasmInterpreterModule** out_module,
                               WasmInterpreterThread* out_thread) {
   WasmResult result;
   void* data;
   size_t size;
-  WASM_ZERO_MEMORY(*out_module);
   WASM_ZERO_MEMORY(*out_thread);
   result = wasm_read_file(allocator, module_filename, &data, &size);
   if (WASM_SUCCEEDED(result)) {
     WasmAllocator* memory_allocator = &g_wasm_libc_allocator;
-    result = wasm_read_binary_interpreter(allocator, memory_allocator, data,
-                                          size, &s_read_binary_options,
+    result = wasm_read_binary_interpreter(allocator, memory_allocator, env,
+                                          data, size, &s_read_binary_options,
                                           &s_error_handler, out_module);
 
     if (WASM_SUCCEEDED(result)) {
-      if (s_verbose) {
-        wasm_disassemble_module(out_module, s_stdout_stream, 0,
-                                out_module->istream.size);
-      }
+      if (s_verbose)
+        wasm_disassemble_module(env, s_stdout_stream, *out_module);
 
-      result = wasm_init_interpreter_thread(allocator, out_module, out_thread,
-                                            &s_thread_options);
-      out_thread->host_func.callback = default_host_callback;
-      out_thread->host_func.user_data = NULL;
+      result = wasm_init_interpreter_thread(allocator, env, *out_module,
+                                            out_thread, &s_thread_options);
     }
     wasm_free(allocator, data);
   }
   return result;
 }
 
-static void destroy_module_and_thread(WasmAllocator* allocator,
-                                      WasmInterpreterModule* module,
-                                      WasmInterpreterThread* thread) {
+static void destroy_environment_and_thread(WasmAllocator* allocator,
+                                           WasmInterpreterEnvironment* env,
+                                           WasmInterpreterThread* thread) {
   wasm_destroy_interpreter_thread(allocator, thread);
-  wasm_destroy_interpreter_module(allocator, module);
+  wasm_destroy_interpreter_environment(allocator, env);
 }
 
 static WasmResult read_and_run_module(WasmAllocator* allocator,
                                       const char* module_filename) {
   WasmResult result;
-  WasmInterpreterModule module;
+  WasmInterpreterEnvironment env;
+  WASM_ZERO_MEMORY(env);
+  WasmInterpreterModule* module = NULL;
   WasmInterpreterThread thread;
-  result = read_module(allocator, module_filename, &module, &thread);
-  if (WASM_SUCCEEDED(result))
-    result = run_start_function(&module, &thread);
-
-  if (WASM_SUCCEEDED(result) && s_run_all_exports)
-    run_all_exports(allocator, &module, &thread, RUN_VERBOSE);
-  destroy_module_and_thread(allocator, &module, &thread);
+  result = read_module(allocator, module_filename, &env, &module, &thread);
+  if (WASM_SUCCEEDED(result)) {
+    result = run_start_function(&thread);
+    if (s_run_all_exports)
+      run_all_exports(allocator, module, &thread, RUN_VERBOSE);
+    destroy_environment_and_thread(allocator, &env, &thread);
+  }
   return result;
 }
 
 static WasmResult read_and_run_spec_json(WasmAllocator* allocator,
                                          const char* spec_json_filename) {
   WasmResult result = WASM_OK;
-  WasmInterpreterModule module;
+  WasmInterpreterEnvironment env;
+  WasmInterpreterModule* module = NULL;
   WasmInterpreterThread thread;
   WasmStringSlice command_file;
   WasmStringSlice command_name;
@@ -514,7 +508,7 @@ static WasmResult read_and_run_spec_json(WasmAllocator* allocator,
   uint32_t passed = 0;
   uint32_t failed = 0;
 
-  WASM_ZERO_MEMORY(module);
+  WASM_ZERO_MEMORY(env);
   WASM_ZERO_MEMORY(thread);
   WASM_ZERO_MEMORY(command_file);
   WASM_ZERO_MEMORY(command_name);
@@ -653,7 +647,7 @@ static WasmResult read_and_run_spec_json(WasmAllocator* allocator,
       case END_MODULE_OBJECT:
         EXPECT('}');
         MAYBE_CONTINUE(MODULES_ARRAY);
-        destroy_module_and_thread(allocator, &module, &thread);
+        destroy_environment_and_thread(allocator, &env, &thread);
         wasm_reset_to_mark(allocator, module_mark);
         has_module = WASM_FALSE;
         break;
@@ -674,13 +668,13 @@ static WasmResult read_and_run_spec_json(WasmAllocator* allocator,
         }
 
         module_mark = wasm_mark(allocator);
-        result = read_module(allocator, path, &module, &thread);
+        result = read_module(allocator, path, &env, &module, &thread);
         if (WASM_FAILED(result))
           goto fail;
 
         has_module = WASM_TRUE;
 
-        result = run_start_function(&module, &thread);
+        result = run_start_function(&thread);
         if (WASM_FAILED(result))
           goto fail;
 
@@ -727,8 +721,8 @@ static WasmResult read_and_run_spec_json(WasmAllocator* allocator,
         WasmInterpreterResult iresult;
         EXPECT('}');
         RunVerbosity verbose = command_type == ACTION ? RUN_VERBOSE : RUN_QUIET;
-        result = run_export_by_name(allocator, &module, &thread, &command_name,
-                                    &iresult, &result_values, verbose);
+        result = run_export_by_name(allocator, &thread, &command_name, &iresult,
+                                    &result_values, verbose);
         if (WASM_FAILED(result)) {
           FAILED("unknown export");
           failed++;
@@ -838,7 +832,7 @@ fail:
 
 done:
   if (has_module)
-    destroy_module_and_thread(allocator, &module, &thread);
+    destroy_environment_and_thread(allocator, &env, &thread);
   wasm_destroy_interpreter_typed_value_vector(allocator, &result_values);
   wasm_free(allocator, data);
   return result;

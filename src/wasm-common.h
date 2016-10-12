@@ -151,13 +151,6 @@ typedef enum WasmExternalKind {
   WASM_NUM_EXTERNAL_KINDS,
 } WasmExternalKind;
 
-extern const char* g_wasm_kind_name[];
-
-static WASM_INLINE const char* wasm_get_kind_name(WasmExternalKind kind) {
-  assert(kind < WASM_NUM_EXTERNAL_KINDS);
-  return g_wasm_kind_name[kind];
-}
-
 typedef struct WasmLimits {
   uint64_t initial;
   uint64_t max;
@@ -450,6 +443,15 @@ static WASM_INLINE WasmType wasm_get_opcode_param_type_2(WasmOpcode opcode) {
 static WASM_INLINE int wasm_get_opcode_memory_size(WasmOpcode opcode) {
   assert(opcode < WASM_NUM_OPCODES);
   return g_wasm_opcode_info[opcode].memory_size;
+}
+
+/* external kind */
+
+extern const char* g_wasm_kind_name[];
+
+static WASM_INLINE const char* wasm_get_kind_name(WasmExternalKind kind) {
+  assert(kind < WASM_NUM_EXTERNAL_KINDS);
+  return g_wasm_kind_name[kind];
 }
 
 WASM_EXTERN_C_END
